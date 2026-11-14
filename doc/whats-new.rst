@@ -6,6 +6,24 @@
 What's New
 ==========
 
+.. _whats-new.2026.11.0:
+
+v2026.11.0 (unreleased)
+-----------------------
+
+New Features
+~~~~~~~~~~~~
+
+- Added :py:meth:`Dataset.resample_interval`, which aggregates irregular source
+  time intervals onto a user supplied target grid using the interval bounds
+  rather than the record labels. It supports both interval averages (``"mean"``)
+  and accumulated totals (``"sum"``), splits records that straddle target cell
+  boundaries proportionally to overlap, reports per-cell finite-data coverage
+  with a ``min_coverage`` threshold, and preserves laziness for dask backed
+  arrays. numpy datetime64 (``s``/``ms``/``us``/``ns``) and cftime calendars
+  (including ``noleap`` and ``360_day``) are supported.
+  By `Claude Code <https://github.com/anthropics>`_.
+
 .. _whats-new.2026.09.0:
 
 v2026.09.0 (Sep 29, 2026)

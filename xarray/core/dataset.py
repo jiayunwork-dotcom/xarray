@@ -10723,6 +10723,144 @@ class Dataset(
             **indexer_kwargs,
         )
 
+    def resample_interval(
+        self,
+        target_edges: Any,
+        *,
+        kinds: Mapping[Hashable, Literal["mean", "sum"]],
+        dim: Hashable = "time",
+        bounds: Hashable | None = None,
+        min_coverage: float = 1.0,
+    ) -> tuple[Dataset, Dataset]:
+        """Regrid irregular time intervals onto a target time grid.
+
+        Unlike :py:meth:`Dataset.resample`, which groups records by their time
+        label, this method uses the *bounds* of every source record.  A record
+        that straddles two output cells is split between them according to
+        how much of it falls into each cell.  Source records may have
+        different durations, may be separated by gaps and need not align with
+        the target grid.
+
+        Two interpretations of the input values are supported:
+
+        * ``"mean"``: the value is the average over its source interval.  It
+          contributes in proportion to the time it overlaps a target cell and
+          the result is the coverage weighted mean.  A 6-hour mean and an
+          18-hour mean therefore combine with weights 6 and 18, not equally.
+        * ``"sum"``: the value is a total accumulated over its source interval
+          that is produced uniformly in time.  It is distributed over target
+          cells in proportion to the overlap and the cell receives the
+          accumulated amount.  The sum is *not* divided by the cell length.
+
+        Missing data (``NaN`` and either infinity) is excluded per variable
+        and per non-time position.  ``coverage`` reports, for each output cell
+        and position, the fraction of the cell spanned by finite data.  When
+        that fraction is below ``min_coverage`` the result is ``NaN`` while
+        ``coverage`` still reports the measured fraction.  Positions without
+        any finite data are always ``NaN`` in the result, even with
+        ``min_coverage=0``.
+
+        Parameters
+        ----------
+        target_edges : sequence of datetime-like
+            One-dimensional, strictly increasing sequence of at least two
+            time edges defining the output cells; cell ``i`` is
+            ``[target_edges[i], target_edges[i + 1])``.  Edges may extend
+            beyond or cut into the source coverage.
+        kinds : mapping of hashable to {"mean", "sum"}
+            Aggregation semantics for every data variable that depends on
+            ``dim`` (except the bounds variable).  The mapping must cover
+            exactly those variables.
+        dim : hashable, default: "time"
+            Name of the one-dimensional time coordinate to resample.
+        bounds : hashable, optional
+            Name of the variable holding the source interval bounds.  When
+            omitted, the ``bounds`` reference of ``dim``'s attrs or encoding
+            is used.
+        min_coverage : float, default: 1.0
+            Minimum fraction of a target cell that must be covered by finite
+            data for the result to be reported.  Must lie in ``[0, 1]``; the
+            comparison is ``coverage >= min_coverage``.
+
+        Returns
+        -------
+        result : Dataset
+            Dataset with the aggregated variables on the target grid.  Its
+            ``dim`` coordinate holds the left edge of each cell and the
+            bounds variable holds the cell edges.
+        coverage : Dataset
+            Dataset with the same variables, dims and dims order, containing
+            the fraction of each target cell covered by finite data (dimension
+            less, in ``[0, 1]``).
+
+        See Also
+        --------
+        Dataset.resample
+        DataArray.resample
+        Dataset.groupby_bins
+
+        Examples
+        --------
+        >>> import numpy as np
+        >>> import xarray as xr
+        >>> time = np.array(
+        ...     ["2000-01-01", "2000-01-02", "2000-01-05"], dtype="datetime64[ns]"
+        ... )
+        >>> bounds = np.array(
+        ...     [
+        ...         ["2000-01-01", "2000-01-02"],
+        ...         ["2000-01-02", "2000-01-04"],
+        ...         ["2000-01-05", "2000-01-06"],
+        ...     ],
+        ...     dtype="datetime64[ns]",
+        ... )
+        >>> ds = xr.Dataset(
+        ...     {"flux": ("time", [1.0, 2.0, 3.0])},
+        ...     coords={
+        ...         "time": ("time", time, {"bounds": "time_bounds"}),
+        ...         "time_bounds": (("time", "nv"), bounds),
+        ...     },
+        ... )
+        >>> edges = np.array(
+        ...     ["2000-01-01", "2000-01-02", "2000-01-03", "2000-01-06"],
+        ...     dtype="datetime64[ns]",
+        ... )
+        >>> result, coverage = ds.resample_interval(
+        ...     edges, kinds={"flux": "sum"}, min_coverage=0.0
+        ... )
+        >>> result["flux"].values
+        array([1., 1., 4.])
+        >>> coverage["flux"].values
+        array([1.        , 1.        , 0.66666667])
+
+        Notes
+        -----
+        Source intervals must have positive duration, be sorted by ascending
+        start and may touch or be separated by gaps, but must not overlap.
+        Every time label must lie inside its own left-closed right-open
+        interval.  Shaped, ordering and interval violations raise
+        ``ValueError``; nothing is silently sorted or clipped.
+
+        Only ``s``, ``ms``, ``us`` and ``ns`` numpy datetime64 resolutions are
+        supported, as well as cftime calendars (``noleap`` and ``360_day``
+        included) using their real day lengths.  Source coordinates, bounds
+        and target edges must share the same time system and calendar, and
+        timezone-aware input is rejected.  Computations are done in exact
+        integer ticks and results are ``float64``.  Dask backed input stays
+        lazy; only the actual overlaps are materialized, never a dense
+        ``n_sources * n_targets`` matrix.
+        """
+        from xarray.core.resample_interval import resample_interval
+
+        return resample_interval(
+            self,
+            target_edges,
+            kinds=kinds,
+            dim=dim,
+            bounds=bounds,
+            min_coverage=min_coverage,
+        )
+
     def drop_attrs(self, *, deep: bool = True) -> Self:
         """
         Removes all attributes from the Dataset and its variables.

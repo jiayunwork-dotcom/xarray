@@ -143,6 +143,7 @@ Computation
    Dataset.weighted
    Dataset.coarsen
    Dataset.resample
+   Dataset.resample_interval
    Dataset.diff
    Dataset.quantile
    Dataset.differentiate

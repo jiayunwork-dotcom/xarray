@@ -285,6 +285,57 @@ resampled_ds
 For more examples of using grouped operations on a time dimension, see {doc}`../examples/weather-data`.
 ```
 
+### Resampling irregular intervals
+
+`resample` groups records by their time *label*: a record belongs entirely to
+the day (or hour, …) its label falls into.  Instrument archives often store
+variables that describe a whole interval instead — either an average holding
+over that interval, or a total accumulated over it — and the intervals need not
+be aligned with any calendar frequency.
+
+For example, a 6-hour average and an 18-hour average cannot simply be averaged
+with equal weights, and a record that straddles a target boundary must be split
+between the two cells.
+
+{py:meth}`Dataset.resample_interval` handles this case.  It takes the edges of
+the source intervals from a bounds variable, integrates each source record over
+the target cells and returns both the aggregated dataset and a coverage
+dataset:
+
+```{code-cell}
+time = np.array(["2000-01-01", "2000-01-02", "2000-01-05"], dtype="datetime64[ns]")
+bounds = np.array(
+    [
+        ["2000-01-01", "2000-01-02"],
+        ["2000-01-02", "2000-01-04"],
+        ["2000-01-05", "2000-01-06"],
+    ],
+    dtype="datetime64[ns]",
+)
+dsb = xr.Dataset(
+    {"flux": ("time", [1.0, 2.0, 3.0])},
+    coords={
+        "time": ("time", time, {"bounds": "time_bounds"}),
+        "time_bounds": (("time", "nv"), bounds),
+    },
+)
+target = np.array(
+    ["2000-01-01", "2000-01-02", "2000-01-03", "2000-01-06"],
+    dtype="datetime64[ns]",
+)
+result, coverage = dsb.resample_interval(target, kinds={"flux": "sum"})
+result["flux"].values
+```
+
+Pass `kinds={"flux": "mean"}` when the stored value is an average over its
+interval and `kinds={"flux": "sum"}` when it is a total produced uniformly in
+time.  The returned `coverage` tells how much of each output cell was covered
+by finite data; `min_coverage` controls the threshold below which the result is
+masked with `NaN`.
+
+```{seealso}
+For examples of using grouped operations on a time dimension, see {doc}`../examples/weather-data`.
+
 (seasonal-grouping)=
 
 ### Handling Seasons
