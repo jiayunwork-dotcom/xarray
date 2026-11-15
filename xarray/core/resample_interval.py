@@ -35,6 +35,7 @@ import pandas as pd
 from xarray.core.indexes import create_default_index_implicit
 from xarray.core.utils import is_duck_array
 from xarray.core.variable import Variable, calculate_dimensions
+from xarray.namedarray.utils import is_duck_dask_array
 
 if TYPE_CHECKING:
     from xarray.core.dataset import Dataset
@@ -53,8 +54,6 @@ _UNIT_NS: dict[str, int] = {
     "us": 10**3,
     "ns": 1,
 }
-
-_NS_PER_SECOND = 10**9
 
 # Units in which output datetime64 values may be rendered, coarsest first.
 _UNITS_COARSE_TO_FINE = ("D", "h", "m", "s", "ms", "us", "ns")
@@ -445,24 +444,125 @@ def _shape_with(ndim: int, axis: int, length: int) -> tuple[int, ...]:
     return tuple(shape)
 
 
-def _prefix_integral(values: Any, axis: int) -> Any:
-    """Cumulative sum along ``axis`` with an extra leading zero cell.
+def _segments(
+    starts: np.ndarray, ends: np.ndarray, edges: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Partition the target span into elementary segments.
 
-    The zero cell keeps the input dtype (so integer coverage stays exact) and,
-    for duck arrays such as dask, keeps the chunking intact.
+    Every segment lies inside exactly one source interval (or in a gap) and
+    inside exactly one target cell, so reducing the segments of one cell
+    only ever combines contributions that belong to that cell.  Returns the
+    segment lengths (exact integer ticks), the source interval index below
+    each segment (``-1`` for gaps), the target cell index below each
+    segment and the first segment index of every target cell.  Every target
+    cell owns at least one segment, so grouped reductions never see an
+    empty group.  The number of segments is at most
+    ``2 * n_sources + n_targets``.
     """
-    indexer = [slice(None)] * values.ndim
-    indexer[axis] = slice(0, 1)
-    zero = values[tuple(indexer)] * 0
-    return np.concatenate([zero, np.cumsum(values, axis=axis)], axis=axis)
+    lo = edges[0]
+    hi = edges[-1]
+    clipped_starts = np.clip(starts, lo, hi)
+    clipped_ends = np.clip(ends, lo, hi)
+    inside = clipped_ends > clipped_starts
+    points = np.concatenate([edges, clipped_starts[inside], clipped_ends[inside]])
+    bounds = np.unique(points)
+    left = bounds[:-1]
+    length = np.diff(bounds)
+
+    candidate = np.searchsorted(starts, left, side="right") - 1
+    valid = (candidate >= 0) & (left < ends[np.clip(candidate, 0, None)])
+    source = np.where(valid, candidate, np.int64(-1))
+
+    target = np.searchsorted(edges, left, side="right") - 1
+    target_starts = np.searchsorted(
+        target, np.arange(edges.size - 1, dtype=target.dtype), side="left"
+    )
+    return (
+        length,
+        source.astype(np.intp),
+        target.astype(np.intp),
+        target_starts.astype(np.intp),
+    )
 
 
-def _difference_along(values: Any, axis: int) -> Any:
-    upper = [slice(None)] * values.ndim
-    lower = [slice(None)] * values.ndim
-    upper[axis] = slice(1, None)
-    lower[axis] = slice(0, -1)
-    return values[tuple(upper)] - values[tuple(lower)]
+class _SegmentBlocks:
+    """Block layout used to reduce the segment axis lazily with dask.
+
+    Whole groups (target cells) are packed into blocks of roughly
+    ``block`` segments so that no group straddles a task boundary and the
+    reduction never has to combine partial groups across tasks.  A single
+    group larger than ``block`` forms its own block, which keeps the work
+    proportional to the actual overlap structure.  The layout depends only
+    on the (shared) segment geometry and the chunking of the source data.
+    """
+
+    __slots__ = ("group_counts", "local_starts", "seg_sizes")
+
+    def __init__(self, starts: np.ndarray, n_segments: int, chunk_hint: int) -> None:
+        counts = np.diff(np.append(starts, n_segments))
+        block = max(1024, 2 * chunk_hint)
+        cumulative = np.cumsum(counts)
+        total = int(cumulative[-1])
+        cuts = np.arange(block, total, block)
+        edges = np.unique(
+            np.concatenate(
+                [
+                    [0],
+                    np.searchsorted(cumulative, cuts, side="right"),
+                    [counts.size],
+                ]
+            )
+        )
+        seg_bounds = np.append(starts, n_segments)
+        self.seg_sizes = tuple(int(s) for s in np.diff(seg_bounds[edges]))
+        self.group_counts = tuple(int(g) for g in np.diff(edges))
+        self.local_starts = [
+            starts[edges[i] : edges[i + 1]] - seg_bounds[edges[i]]
+            for i in range(edges.size - 1)
+        ]
+
+
+def _take_segments(values: Any, index: np.ndarray, axis: int, layout: Any) -> Any:
+    """Gather ``values`` along ``axis`` and align dask chunks to ``layout``."""
+    out = np.take(values, index, axis=axis)
+    if layout is not None and is_duck_dask_array(out):
+        out = out.rechunk({axis: layout.seg_sizes})
+    return out
+
+
+def _dask_segmented_reduce(
+    values: Any, layout: _SegmentBlocks, axis: int, op: str
+) -> Any:
+    """Reduce segments within each group along ``axis``, block by block."""
+    import dask.array as dask_array
+
+    ufunc = np.maximum if op == "maximum" else np.add
+    local_starts = layout.local_starts
+
+    def _reduce(block: Any, block_info: Any = None) -> Any:
+        location = block_info[0]["chunk-location"][axis]
+        return ufunc.reduceat(block, local_starts[location], axis=axis)
+
+    values = values.rechunk({axis: layout.seg_sizes})
+    chunks = list(values.chunks)
+    chunks[axis] = layout.group_counts
+    return dask_array.map_blocks(_reduce, values, dtype=values.dtype, chunks=chunks)
+
+
+def _segmented_reduce(
+    values: Any, starts: np.ndarray, axis: int, op: str, layout: Any
+) -> Any:
+    """Reduce segments within each group along ``axis``.
+
+    ``starts`` holds the first segment index of every group; group ``g``
+    covers segments ``starts[g] .. starts[g + 1]`` (or the end of the
+    axis).  Groups are never empty.  ``op`` is ``"add"`` or ``"maximum"``.
+    """
+    if is_duck_dask_array(values):
+        return _dask_segmented_reduce(values, layout, axis, op)
+    if op == "maximum":
+        return np.maximum.reduceat(values, starts, axis=axis)
+    return np.add.reduceat(values, starts, axis=axis)
 
 
 def _ticks_to_datetime64(
@@ -628,28 +728,28 @@ def resample_interval(
                 f"{position + 1} is not greater than edge {position}"
             )
 
-    # --- geometry of target edges relative to source intervals ----------
+    # --- geometry of target cells relative to source intervals ----------
     cell_count = edge_int.size - 1
     target_ticks = edge_int[1:] - edge_int[:-1]
-    ticks_to_seconds = divisor / _NS_PER_SECOND
 
-    # ``j`` is the index of the last source interval starting strictly before
-    # the edge; ``jc`` clips it for safe indexing.  ``edge_partial`` is the
-    # number of ticks of that interval preceding the edge, and ``frac`` the
-    # same as a fraction of the interval duration.
-    j = np.searchsorted(starts, edge_int, side="right") - 1
-    jc = np.clip(j, 0, starts.size - 1).astype(np.intp)
-    interval_starts = starts[jc]
-    interval_ends = ends[jc]
-    clipped = np.where(
-        edge_int < interval_starts,
-        interval_starts,
-        np.where(edge_int > interval_ends, interval_ends, edge_int),
+    # Split the target span into elementary segments.  Every segment lies
+    # inside exactly one source interval (or a gap) and one target cell, so
+    # a target cell is only ever influenced by source intervals it actually
+    # intersects: contributions are reduced per cell instead of being
+    # recovered by differencing a running total, which would let large
+    # values in unrelated cells cancel small local ones (and overflow).
+    seg_length, seg_source, seg_target, target_starts = _segments(
+        starts, ends, edge_int
     )
-    edge_partial = clipped - interval_starts
-    frac = edge_partial.astype(np.float64) / durations[jc].astype(np.float64)
-
-    duration_seconds = durations.astype(np.float64) * ticks_to_seconds
+    seg_count = seg_length.size
+    seg_source_safe = np.clip(seg_source, 0, None)
+    # Exact ticks of valid source covered by each segment (0 for gaps) and,
+    # for ``sum``, the fraction of its source interval each segment
+    # represents (at most 1, so terms never exceed the source magnitude).
+    seg_valid_length = np.where(seg_source >= 0, seg_length, np.int64(0))
+    seg_fraction = np.where(
+        seg_source >= 0, seg_length / durations[seg_source_safe], 0.0
+    )
 
     # --- numeric core, one variable at a time ---------------------------
     results: dict[Hashable, Variable] = {}
@@ -660,52 +760,70 @@ def resample_interval(
         source_variable = dataset._variables[name]
         used_dims.update(source_variable.dims)
         axis = source_variable.dims.index(dim)
-        broadcast = _shape_with(source_variable.ndim, axis, durations.size)
+        broadcast = _shape_with(source_variable.ndim, axis, seg_count)
 
         values = _as_float64(source_variable.data)
         finite = np.isfinite(values)
         filled = np.where(finite, values, np.float64(0.0))
 
-        # Coverage: exact integer ticks of finite data in each cell.  The
-        # partial source interval preceding an edge only counts when its own
-        # value is finite.
+        if is_duck_dask_array(values):
+            known_chunks = [
+                int(c) for c in values.chunks[axis] if not math.isnan(c)
+            ]
+            layout: _SegmentBlocks | None = _SegmentBlocks(
+                target_starts, seg_count, max(known_chunks, default=1024)
+            )
+        else:
+            layout = None
+
+        # Coverage: exact integer ticks of finite data in each cell.  No
+        # rounding is involved, so the coverage threshold comparison is
+        # exact even when the threshold is hit on the nose.
         mask = finite.astype(np.int64)
-        covered_amounts = mask * durations.reshape(broadcast)
-        shape = _shape_with(source_variable.ndim, axis, edge_partial.size)
-        # Exact integer ticks: ``prefix`` accumulates whole finite source
-        # intervals, while the partial interval before each edge contributes
-        # its exact tick count when finite.  No rounding is involved, so the
-        # coverage threshold comparison is exact.
-        evaluated = np.take(
-            _prefix_integral(covered_amounts, axis), jc, axis=axis
-        ) + np.take(mask, jc, axis=axis) * edge_partial.reshape(shape)
-        covered_ticks = _difference_along(evaluated, axis)
+        mask_seg = _take_segments(mask, seg_source_safe, axis, layout)
+        covered_seg = mask_seg * seg_valid_length.reshape(broadcast)
+        covered_ticks = _segmented_reduce(
+            covered_seg, target_starts, axis, "add", layout
+        )
+
+        filled_seg = _take_segments(filled, seg_source_safe, axis, layout)
 
         if kind == "mean":
-            amounts = filled * duration_seconds.reshape(broadcast)
+            # Convex combination over the cell: each weight is the share of
+            # the covered duration contributed by its segment, so weights
+            # are at most 1 and every partial sum stays bounded by the
+            # largest magnitude in the cell.  The mean of finite values
+            # therefore cannot overflow to inf.
+            safe_covered = np.where(
+                covered_ticks > 0, covered_ticks, np.int64(1)
+            ).astype(np.float64)
+            normalizer = _take_segments(safe_covered, seg_target, axis, layout)
+            weights = (
+                seg_valid_length.astype(np.float64).reshape(broadcast) / normalizer
+            )
+            integrated = _segmented_reduce(
+                filled_seg * weights, target_starts, axis, "add", layout
+            )
         else:
-            amounts = filled
-        # The part of the source interval preceding an edge contributes
-        # ``amounts * frac``; ``frac`` is the covered fraction of that
-        # interval, so this works for both kinds.
-        weights = frac.reshape(shape)
-        evaluated = (
-            np.take(_prefix_integral(amounts, axis), jc, axis=axis)
-            + np.take(amounts, jc, axis=axis) * weights
-        )
-        numerator = _difference_along(evaluated, axis)
+            terms = filled_seg * seg_fraction.reshape(broadcast)
+            # Scale every cell by its largest term before accumulating, so
+            # intermediate sums stay within the range of the true result:
+            # a representable sum of finite values is never reported as inf
+            # or NaN because of intermediate overflow.
+            scale = _segmented_reduce(
+                np.abs(terms), target_starts, axis, "maximum", layout
+            )
+            safe_scale = np.where(scale > 0, scale, np.float64(1.0))
+            normalizer = _take_segments(safe_scale, seg_target, axis, layout)
+            summed = _segmented_reduce(
+                terms / normalizer, target_starts, axis, "add", layout
+            )
+            integrated = summed * scale
 
         ratio = covered_ticks.astype(np.float64) / target_ticks.astype(
             np.float64
         ).reshape(_shape_with(source_variable.ndim, axis, cell_count))
         ratio = np.clip(ratio, 0.0, 1.0)
-
-        if kind == "mean":
-            covered_seconds = covered_ticks.astype(np.float64) * ticks_to_seconds
-            safe = np.where(covered_ticks > 0, covered_seconds, np.float64(1.0))
-            integrated = numerator / safe
-        else:
-            integrated = numerator
 
         keep = (covered_ticks > 0) & (ratio >= min_coverage)
         result_data = np.where(keep, integrated, np.float64(np.nan))

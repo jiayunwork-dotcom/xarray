@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from fractions import Fraction
+
 import numpy as np
 import pytest
 
@@ -835,6 +837,320 @@ class TestInvariants:
             )
 
 
+class TestNumericalLocality:
+    """Each target cell must only be influenced by the sources it overlaps.
+
+    Regression tests for the prefix-sum numerics that let a large value in
+    one cell cancel (or overflow) the contributions of its neighbours.
+    """
+
+    @staticmethod
+    def _day_dataset(values):
+        edges = np.array(
+            ["2020-01-01", "2020-01-02", "2020-01-03"], dtype="datetime64[s]"
+        )
+        ds = xr.Dataset(
+            {"v": ("time", np.asarray(values, dtype=float))},
+            coords={
+                "time": ("time", edges[:-1], {"bounds": "tb"}),
+                "tb": (("time", "b"), np.stack([edges[:-1], edges[1:]], axis=1)),
+            },
+        )
+        return ds, edges
+
+    @pytest.mark.parametrize("kind", ["mean", "sum"])
+    def test_source_boundaries_preserve_mixed_magnitudes(self, kind):
+        """Resampling on the original boundaries must be a no-op, even when
+        a huge value sits next to a tiny one."""
+        ds, edges = self._day_dataset([1e20, 1.0])
+        result, coverage = ds.resample_interval(edges, kinds={"v": kind})
+        np.testing.assert_array_equal(result["v"].values, [1e20, 1.0])
+        np.testing.assert_array_equal(coverage["v"].values, [1.0, 1.0])
+
+    @requires_dask
+    @pytest.mark.parametrize("kind", ["mean", "sum"])
+    def test_source_boundaries_preserve_mixed_magnitudes_dask(self, kind):
+        import dask.array as dask_array
+
+        ds, edges = self._day_dataset([1e20, 1.0])
+        result, coverage = ds.chunk({"time": 1}).resample_interval(
+            edges, kinds={"v": kind}
+        )
+        assert isinstance(result["v"].variable._data, dask_array.Array)
+        np.testing.assert_array_equal(result["v"].values, [1e20, 1.0])
+        np.testing.assert_array_equal(coverage["v"].values, [1.0, 1.0])
+
+    @pytest.mark.parametrize("kind", ["mean", "sum"])
+    def test_extreme_values_stay_finite_on_source_boundaries(self, kind):
+        ds, edges = self._day_dataset([1e308, 1e308])
+        result, coverage = ds.resample_interval(edges, kinds={"v": kind})
+        np.testing.assert_array_equal(result["v"].values, [1e308, 1e308])
+        np.testing.assert_array_equal(coverage["v"].values, [1.0, 1.0])
+
+    def test_merged_mean_of_extreme_values_stays_finite(self):
+        ds, _ = self._day_dataset([1e308, 1e308])
+        edges = np.array(["2020-01-01", "2020-01-03"], dtype="datetime64[s]")
+        result, coverage = ds.resample_interval(edges, kinds={"v": "mean"})
+        np.testing.assert_array_equal(result["v"].values, [1e308])
+        np.testing.assert_array_equal(coverage["v"].values, [1.0])
+
+    def test_merged_mean_of_mixed_magnitudes(self):
+        ds, _ = self._day_dataset([1e20, 1.0])
+        edges = np.array(["2020-01-01", "2020-01-03"], dtype="datetime64[s]")
+        result, _ = ds.resample_interval(edges, kinds={"v": "mean"})
+        # The exactly representable float64 outcome of (1e20 + 1) / 2.
+        np.testing.assert_array_equal(result["v"].values, [1e20 / 2])
+
+    @pytest.mark.parametrize("kind", ["mean", "sum"])
+    def test_opposite_extremes_cancel_without_overflow(self, kind):
+        ds, _ = self._day_dataset([1e308, -1e308])
+        edges = np.array(["2020-01-01", "2020-01-03"], dtype="datetime64[s]")
+        result, _ = ds.resample_interval(edges, kinds={"v": kind})
+        np.testing.assert_array_equal(result["v"].values, [0.0])
+
+    def test_neighbouring_cells_do_not_interfere(self):
+        """A huge value must not leak into the cell of a tiny neighbour."""
+        time = np.array(
+            ["2020-01-01", "2020-01-02", "2020-01-03"], dtype="datetime64[s]"
+        )
+        bounds = np.array(
+            [
+                ["2020-01-01", "2020-01-02"],
+                ["2020-01-02", "2020-01-03"],
+                ["2020-01-03", "2020-01-04"],
+            ],
+            dtype="datetime64[s]",
+        )
+        ds = _bounds_dataset([1e25, 1.0, 1e-25], bounds, times=time)
+        edges = np.array(
+            ["2020-01-01", "2020-01-02", "2020-01-03", "2020-01-04"],
+            dtype="datetime64[s]",
+        )
+        for kind in ("mean", "sum"):
+            result, coverage = ds.resample_interval(edges, kinds={"v": kind})
+            np.testing.assert_array_equal(
+                result["v"].values, [1e25, 1.0, 1e-25]
+            )
+            np.testing.assert_array_equal(coverage["v"].values, [1.0, 1.0, 1.0])
+
+
+def _exact_reference(starts, ends, values, edges, kind, min_coverage):
+    """Exact rational reference for one 1-D series, in integer tick units.
+
+    Returns ``(result, coverage, scale)`` where ``scale`` is the per-cell
+    sum of the absolute contributions (for ``"mean"`` divided by the
+    covered duration); it sets the error scale when contributions cancel.
+    Only sources overlapping a cell enter that cell's scale, so large
+    values outside a cell cannot loosen its tolerance.
+    """
+    cell_count = len(edges) - 1
+    result = np.full(cell_count, np.nan)
+    coverage = np.zeros(cell_count)
+    scale = np.zeros(cell_count)
+    for k in range(cell_count):
+        e0, e1 = int(edges[k]), int(edges[k + 1])
+        total = Fraction(0)
+        absolute = Fraction(0)
+        covered = 0
+        for i in range(len(starts)):
+            overlap = min(int(ends[i]), e1) - max(int(starts[i]), e0)
+            if overlap <= 0 or not np.isfinite(values[i]):
+                continue
+            covered += overlap
+            if kind == "mean":
+                term = Fraction(float(values[i])) * overlap
+            else:
+                term = Fraction(float(values[i])) * Fraction(
+                    overlap, int(ends[i]) - int(starts[i])
+                )
+            total += term
+            absolute += abs(term)
+        coverage[k] = covered / (e1 - e0)
+        if covered:
+            if kind == "mean":
+                exact = total / covered
+                absolute /= covered
+            else:
+                exact = total
+            try:
+                scale[k] = float(absolute)
+            except OverflowError:
+                scale[k] = np.inf
+            if coverage[k] >= min_coverage:
+                result[k] = float(exact)
+    return result, coverage, scale
+
+
+def _assert_matches_exact(actual, actual_coverage, expected, expected_coverage, scale):
+    rtol = atol = 1e-10
+    assert np.array_equal(np.isnan(actual), np.isnan(expected))
+    for got, want, cell_scale in zip(
+        np.ravel(actual), np.ravel(expected), np.ravel(scale), strict=True
+    ):
+        if np.isnan(want):
+            continue
+        allowed = atol + rtol * max(abs(want), cell_scale)
+        assert abs(got - want) <= allowed, f"{got} != {want} (scale {cell_scale})"
+    np.testing.assert_allclose(
+        actual_coverage, expected_coverage, rtol=1e-12, atol=1e-12
+    )
+
+
+def _irregular_case(rng, n_y=3):
+    """Irregular non-overlapping intervals plus out-of-span extreme sources.
+
+    Returns integer-second starts/ends, a (n_sources, n_y) value array with
+    mixed magnitudes, signs and per-position missing data, and target edges
+    that cut through sources, span several of them and cross gaps.
+    """
+    n = 9
+    durations = rng.integers(1, 6, n)
+    gaps = rng.integers(0, 3, n)
+    starts = np.zeros(n, dtype=np.int64)
+    t = 0
+    for i in range(n):
+        t += int(gaps[i])
+        starts[i] = t
+        t += int(durations[i])
+    ends = starts + durations
+    span_end = int(t)
+
+    cuts = {-2, span_end + 2}
+    for s, e in zip(starts, ends, strict=True):
+        if rng.random() < 0.6:
+            cuts.add(int(s))
+        if rng.random() < 0.4:
+            cuts.add(int((s + e) // 2))
+        if rng.random() < 0.6:
+            cuts.add(int(e))
+    edges = np.array(sorted(cuts), dtype=np.int64)
+
+    values = 10.0 ** rng.uniform(-8, 8, (n, n_y))
+    values *= rng.choice([-1.0, 1.0], size=(n, n_y))
+    missing = rng.random((n, n_y)) < 0.15
+    values[missing] = np.nan
+    infinite = rng.random((n, n_y)) < 0.1
+    values[infinite] = rng.choice([-np.inf, np.inf], size=int(infinite.sum()))
+
+    # Sources strictly outside the target span with extreme values: they
+    # must not influence any cell.
+    starts = np.concatenate([[-10**6, -10**4], starts, [span_end + 10**4]])
+    ends = np.concatenate([[-10**4, -10**3], ends, [span_end + 10**5]])
+    pad = np.array([[1e25] * n_y, [-1e25] * n_y, [1e25] * n_y])
+    values = np.concatenate([pad[:2], values, pad[2:]], axis=0)
+    return starts, ends, values, edges
+
+
+def _seconds_dataset(starts, ends, values):
+    t0 = np.datetime64("2020-01-01", "s")
+    bounds = np.stack(
+        [
+            t0 + starts.astype("timedelta64[s]"),
+            t0 + ends.astype("timedelta64[s]"),
+        ],
+        axis=1,
+    )
+    n_y = values.shape[1]
+    return xr.Dataset(
+        {"v": (("time", "y"), values)},
+        coords={
+            "time": ("time", bounds[:, 0], {"bounds": "tb"}),
+            "tb": (("time", "b"), bounds),
+            "y": [f"y{i}" for i in range(n_y)],
+        },
+    )
+
+
+class TestExactReference:
+    """Cross-check local contributions against exact rational arithmetic."""
+
+    @pytest.mark.parametrize("kind", ["mean", "sum"])
+    @pytest.mark.parametrize("min_coverage", [0.0, 0.5, 1.0])
+    @pytest.mark.parametrize("seed", [0, 1])
+    def test_randomized_against_exact_reference(self, kind, min_coverage, seed):
+        rng = np.random.default_rng(1000 + seed)
+        starts, ends, values, edges = _irregular_case(rng)
+        ds = _seconds_dataset(starts, ends, values)
+        edge_times = np.datetime64("2020-01-01", "s") + edges.astype(
+            "timedelta64[s]"
+        )
+        result, coverage = ds.resample_interval(
+            edge_times, kinds={"v": kind}, min_coverage=min_coverage
+        )
+        for y in range(values.shape[1]):
+            expected, expected_coverage, scale = _exact_reference(
+                starts, ends, values[:, y], edges, kind, min_coverage
+            )
+            _assert_matches_exact(
+                result["v"].values[:, y],
+                coverage["v"].values[:, y],
+                expected,
+                expected_coverage,
+                scale,
+            )
+
+
+class TestLocalityInvariance:
+    """Out-of-span sources and target subsetting must not change results."""
+
+    @pytest.mark.parametrize("kind", ["mean", "sum"])
+    def test_disjoint_prefix_suffix_changes_are_invisible(self, kind):
+        rng = np.random.default_rng(7)
+        starts, ends, values, edges = _irregular_case(rng)
+        edge_times = np.datetime64("2020-01-01", "s") + edges.astype(
+            "timedelta64[s]"
+        )
+
+        # ``values`` already contains extreme prefix/suffix sources; the
+        # stripped dataset removes them, the modified one changes them.
+        keep = slice(2, -1)
+        stripped = _seconds_dataset(starts[keep], ends[keep], values[keep])
+        modified_values = values.copy()
+        modified_values[:2] = np.nan
+        modified_values[-1] = 3.3e-30
+        modified = _seconds_dataset(starts, ends, modified_values)
+        full = _seconds_dataset(starts, ends, values)
+
+        reference, reference_coverage = stripped.resample_interval(
+            edge_times, kinds={"v": kind}, min_coverage=0.3
+        )
+        for variant in (full, modified):
+            result, coverage = variant.resample_interval(
+                edge_times, kinds={"v": kind}, min_coverage=0.3
+            )
+            np.testing.assert_array_equal(
+                result["v"].values, reference["v"].values
+            )
+            np.testing.assert_array_equal(
+                coverage["v"].values, reference_coverage["v"].values
+            )
+            np.testing.assert_array_equal(
+                result["time"].values, reference["time"].values
+            )
+
+    @pytest.mark.parametrize("kind", ["mean", "sum"])
+    def test_single_target_matches_batch(self, kind):
+        rng = np.random.default_rng(11)
+        starts, ends, values, edges = _irregular_case(rng)
+        ds = _seconds_dataset(starts, ends, values)
+        t0 = np.datetime64("2020-01-01", "s")
+        edge_times = t0 + edges.astype("timedelta64[s]")
+
+        batch, batch_coverage = ds.resample_interval(
+            edge_times, kinds={"v": kind}, min_coverage=0.4
+        )
+        for k in range(edges.size - 1):
+            single, single_coverage = ds.resample_interval(
+                edge_times[k : k + 2], kinds={"v": kind}, min_coverage=0.4
+            )
+            np.testing.assert_array_equal(
+                single["v"].values, batch["v"].values[k : k + 1]
+            )
+            np.testing.assert_array_equal(
+                single_coverage["v"].values, batch_coverage["v"].values[k : k + 1]
+            )
+
+
 class TestDask:
     @requires_dask
     def test_lazy_and_matches_numpy(self):
@@ -941,3 +1257,106 @@ class TestDask:
         # nodes), not with n_sources * n_targets.
         assert len(result["v"].variable._data.dask) < 100 * n_targets
         np.testing.assert_allclose(result["v"].values[:3], [0.0, 1.0, 2.0])
+
+    @requires_dask
+    @pytest.mark.parametrize("kind", ["mean", "sum"])
+    def test_full_result_invariant_across_chunkings(self, kind):
+        """Values and NaN positions must not depend on time/space chunking."""
+        import dask.array as dask_array
+
+        rng = np.random.default_rng(5)
+        starts, ends, values, edges = _irregular_case(rng, n_y=4)
+        # add a spatial dimension and per-position extreme magnitudes
+        values2d = np.stack([values, values[::-1] * 1e12], axis=1)
+        t0 = np.datetime64("2020-01-01", "s")
+        bounds = np.stack(
+            [t0 + starts.astype("timedelta64[s]"), t0 + ends.astype("timedelta64[s]")],
+            axis=1,
+        )
+        ds = xr.Dataset(
+            {"v": (("time", "x", "y"), values2d)},
+            coords={
+                "time": ("time", bounds[:, 0], {"bounds": "tb"}),
+                "tb": (("time", "b"), bounds),
+                "x": [0, 1],
+                "y": [f"y{i}" for i in range(values2d.shape[2])],
+            },
+        )
+        edge_times = t0 + edges.astype("timedelta64[s]")
+        reference, reference_coverage = ds.resample_interval(
+            edge_times, kinds={"v": kind}, min_coverage=0.3
+        )
+
+        n = starts.size
+        for time_chunks in (1, 3, 7, n):
+            chunked = ds.chunk({"time": time_chunks, "x": 1, "y": (1, 3)})
+            result, coverage = chunked.resample_interval(
+                edge_times, kinds={"v": kind}, min_coverage=0.3
+            )
+            data = result["v"].variable._data
+            assert isinstance(data, dask_array.Array)
+            # Spatial chunking is preserved.
+            assert data.chunks[1] == (1, 1)
+            assert data.chunks[2] == (1, 3)
+            actual = result["v"].values
+            np.testing.assert_allclose(
+                actual, reference["v"].values, rtol=1e-10, atol=1e-10
+            )
+            assert np.array_equal(
+                np.isnan(actual), np.isnan(reference["v"].values)
+            )
+            np.testing.assert_allclose(
+                coverage["v"].values, reference_coverage["v"].values
+            )
+
+    @requires_dask
+    @pytest.mark.parametrize("kind", ["mean", "sum"])
+    def test_single_target_matches_batch_dask(self, kind):
+        """Single-cell computations agree with the batch under chunking."""
+        rng = np.random.default_rng(23)
+        starts, ends, values, edges = _irregular_case(rng, n_y=2)
+        ds = _seconds_dataset(starts, ends, values).chunk({"time": 3})
+        t0 = np.datetime64("2020-01-01", "s")
+        edge_times = t0 + edges.astype("timedelta64[s]")
+
+        batch, batch_coverage = ds.resample_interval(
+            edge_times, kinds={"v": kind}, min_coverage=0.4
+        )
+        for k in range(edges.size - 1):
+            single, single_coverage = ds.resample_interval(
+                edge_times[k : k + 2], kinds={"v": kind}, min_coverage=0.4
+            )
+            np.testing.assert_allclose(
+                single["v"].values, batch["v"].values[k : k + 1],
+                rtol=1e-10, atol=1e-10,
+            )
+            assert np.array_equal(
+                np.isnan(single["v"].values), np.isnan(batch["v"].values[k : k + 1])
+            )
+            np.testing.assert_allclose(
+                single_coverage["v"].values, batch_coverage["v"].values[k : k + 1]
+            )
+
+    @requires_dask
+    def test_segment_axis_is_not_forced_into_one_chunk(self):
+        """Many small source chunks must not be merged into a single block."""
+        n = 4_000
+        t0 = np.datetime64("2000-01-01", "s")
+        starts = np.arange(n, dtype="timedelta64[s]")
+        bounds = np.stack([t0 + starts, t0 + starts + np.timedelta64(1, "s")], axis=1)
+        dataset = xr.Dataset(
+            {"v": ("time", np.arange(n, dtype=float))},
+            coords={
+                "time": ("time", t0 + starts, {"bounds": "tb"}),
+                "tb": (("time", "nv"), bounds),
+            },
+        ).chunk({"time": 50})
+        edges = t0 + np.arange(0, n + 1, 3).astype("timedelta64[s]")
+        result, _ = dataset.resample_interval(edges, kinds={"v": "sum"})
+        time_chunks = result["v"].variable._data.chunks[0]
+        assert len(time_chunks) > 1
+        assert sum(time_chunks) == edges.size - 1
+        np.testing.assert_allclose(
+            result["v"].values[:4],
+            [0 + 1 + 2, 3 + 4 + 5, 6 + 7 + 8, 9 + 10 + 11],
+        )
